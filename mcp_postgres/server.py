@@ -1,6 +1,7 @@
 """Read-only PostgreSQL MCP server for Avanti Fellows DB Service."""
 
 import json
+import re
 import os
 from contextlib import asynccontextmanager
 
@@ -26,22 +27,66 @@ DB_CONFIG = {
 @asynccontextmanager
 async def get_connection():
     """Get a database connection."""
-    conn = await asyncpg.connect(**DB_CONFIG)
+    # Server-side guard: every transaction on this connection is READ ONLY, so
+    # Postgres itself rejects INSERT/UPDATE/DELETE/DDL regardless of how the
+    # statement text is shaped. is_read_only() below is only the friendly
+    # pre-check that turns a would-be server error into a clear message.
+    conn = await asyncpg.connect(
+        **DB_CONFIG, server_settings={"default_transaction_read_only": "on"}
+    )
     try:
         yield conn
     finally:
         await conn.close()
 
 
+# Statements that are never read-only. Matched as whole tokens, never as
+# substrings — `deleted_at`, `inserted_at`, `revoked_at`, `AS insert_day` are
+# ordinary identifiers and must pass (D43/D95/D120).
+_WRITE_KEYWORDS = frozenset({
+    "INSERT", "UPDATE", "DELETE", "MERGE", "DROP", "ALTER", "TRUNCATE",
+    "CREATE", "GRANT", "REVOKE", "COPY", "CALL",
+})
+_READ_LEADERS = ("SELECT", "WITH")
+
+_SQL_NOISE = re.compile(
+    r"""
+      --[^\n]*                     # line comment
+    | /\*.*?\*/                     # block comment
+    | \$(\w*)\$.*?\$\1\$            # dollar-quoted string
+    | [eE]?'(?:[^']|'')*'           # string literal ('' escape, E'' prefix)
+    | (?:U&)?"(?:[^"]|"")*"          # quoted identifier (incl. U&"...")
+    """,
+    re.S | re.X,
+)
+_TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_$]*")
+
+
+def _strip_noise(sql: str) -> str:
+    """Remove comments, string literals and quoted identifiers so keyword
+    scanning only ever sees bare SQL tokens."""
+    return _SQL_NOISE.sub(" ", sql)
+
+
 def is_read_only(sql: str) -> bool:
-    """Check if SQL is read-only (SELECT only)."""
-    normalized = sql.strip().upper()
-    # Must start with SELECT or WITH (for CTEs)
-    if not (normalized.startswith("SELECT") or normalized.startswith("WITH")):
+    """True iff `sql` is a single SELECT/WITH statement with no data-modifying
+    keyword as a whole token.
+
+    Tokenises instead of substring-matching: the previous check refused any
+    SQL containing 'DELETE' anywhere, which rejected every query naming an
+    Ecto `deleted_at`/`inserted_at` column. The real enforcement is the
+    READ ONLY transaction set in get_connection(); this is the pre-check.
+    """
+    bare = _strip_noise(sql).strip()
+    if not bare:
         return False
-    # Block dangerous keywords even in subqueries
-    dangerous = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE", "CREATE", "GRANT", "REVOKE"]
-    return not any(kw in normalized for kw in dangerous)
+    # One statement only: a trailing semicolon is fine, an interior one is not.
+    if ";" in bare.rstrip().rstrip(";"):
+        return False
+    tokens = [t.upper() for t in _TOKEN.findall(bare)]
+    if not tokens or tokens[0] not in _READ_LEADERS:
+        return False
+    return not any(t in _WRITE_KEYWORDS for t in tokens)
 
 
 @mcp.tool()
